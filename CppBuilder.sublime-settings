@@ -12,8 +12,7 @@
     ],
 
     //header directory
-    "include_dir": [
-    ],
+    "include_dir": "",
 
     //where to get the .cpp files
     "src_dir": "",

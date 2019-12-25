@@ -1,267 +1,190 @@
 import sublime
 import sublime_plugin
-import subprocess
+
+from collections import namedtuple
+import glob
 import os
-import sys
-import zipfile
-
-from subprocess import CalledProcessError
-
-try:
-    from subprocess import CREATE_NEW_CONSOLE
-except Exception as e:
-    pass
-
-try:
-    from .edit import Edit as Edit
-except:
-    from edit import Edit as Edit
+import re
+import subprocess
+import threading
+import time
 
 
-class BuildProjectCommand(sublime_plugin.TextCommand):
+Target = namedtuple('Target', 'fullname basename')
 
-    # build the project by running make
 
-    def run(self, edit):
-        self.output = ''
-        sublime.set_timeout_async(self.build)
-        sublime.set_timeout_async(self.printoutput)
+class CppBuilderListCommand(sublime_plugin.WindowCommand):
 
-    def build(self):
-        p = self.view.window().folders()[0]
-        curdir = os.getcwd()
-        os.chdir(p)
+    encoding = 'utf-8'
+    killed = False
+    proc = None
+    panel = None
+    panel_lock = threading.Lock()
+    st = 0
+    ed = 0
+
+    def run(self, kill=False):
+        if kill:
+            if self.proc:
+                self.killed = True
+                self.proc.terminate()
+            return
+
+        vars = self.window.extract_variables()
+        self.working_dir = vars['file_path']
+
+        content = self.read_makefile()
+        if not content:
+            return
+
         try:
+            self.targets = list(self.get_targets(content))
+            sublime.active_window().show_quick_panel(
+                [target.basename for target in self.targets],
+                self.on_done
+            )
+        except Exception:
+            self.proc = None
 
-            self.output = subprocess.check_output(
-                                                "make",
-                                                universal_newlines=True,
-                                                stderr=subprocess.STDOUT,
-                                                shell=True
-                                                )
-        except CalledProcessError as e:
-            self.output = e.output
+    def on_done(self, chosen):
+        if chosen == -1:
+            return
+
+        with self.panel_lock:
+            self.panel = self.window.create_output_panel('exec')
+            settings = self.panel.settings()
+            settings.set(
+                'result_file_regex',
+                r'^File "([^"]+)" line (\d+) col (\d+)'
+            )
+            settings.set(
+                'result_line_regex',
+                r'^\s+line (\d+) col (\d+)'
+            )
+            settings.set('result_base_dir', self.working_dir)
+
+            self.window.run_command('show_panel', {'panel': 'output.exec'})
+
+        if self.proc is not None:
+            self.proc.terminate()
+            self.proc = None
+
+        make_target = self.targets[chosen].fullname
+        self.st = time.perf_counter()
+        self.proc = subprocess.Popen(
+            ['make', make_target],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=self.working_dir
+        )
+
+        threading.Thread(
+            target=self.read_handle,
+            args=(self.proc.stdout,)
+        ).start()
+
+    def is_enabled(self, lint=False, integration=False, kill=False):
+        # The Cancel build option should only be available
+        # when the process is still running
+        if kill:
+            return self.proc is not None and self.proc.poll() is None
+        return True
+
+    def read_makefile(self):
+        '''Read Makefile/makefile in pwd, return its content'''
+        back_out = os.getcwd()
+        os.chdir(self.working_dir)
+        matches = glob.glob("[mM]akefile")
+
+        content = ''
+        try:
+            if len(matches) == 1:
+                with open(matches[0], 'r', encoding='utf8') as f:
+                    content = f.read()
+
+            elif len(matches) < 1:
+                sublime.message_dialog(
+                    "No Makefile/makefile found in current directory")
+
+            elif len(matches) > 1:
+                sublime.message_dialog(
+                    "More than one Makefile/makefile found in current directory")
+        except Exception:
+            sublime.message_dialog(
+                "Error occur when looking for Makefile/makefile")
         finally:
-            os.chdir(curdir)
+            os.chdir(back_out)
 
-    def show_output(self, message):
-        panel = self.view.window().create_output_panel("CppBuilder")
+        return content
 
-        with Edit(panel) as edit:
-            edit.insert(0, message)
+    def get_targets(self, content):
+        '''Set self.targets with named tuple for targets info
 
-        self.view.window().run_command(
-                                    'show_panel',
-                                    {'panel': 'output.CppBuilder'}
-                                    )
+        Target(<full target content>, <target base name>)'''
+        tar_patt = re.compile(r'(?<=\n)(.+?)(?=:)')
+        matches = tar_patt.finditer(content)
+        targets = map(
+            lambda match: Target(
+                match.group(0), os.path.basename(match.group(1))
+            ),
+            matches
+        )
 
-    def printoutput(self):
-        self.show_output(self.output)
+        var_patt = re.compile(r'^(.+?)\s*=\s*(.+)$', re.M)
+        matches = var_patt.findall(content)
 
+        var_table = {}
+        for match in matches:
+            var_table[match[0]] = match[1]
 
-class CleanProjectCommand(sublime_plugin.TextCommand):
+        place_holder_patt = re.compile(r'\$\((.+)\)')
+        expan_result = []
+        for target in targets:
+            result = place_holder_patt.sub(
+                lambda match: var_table[match.group(1)],
+                target.fullname
+            )
+            expan_result.append(Target(result, target.basename))
 
-    # clean the project by running 'make clean'
+        return expan_result
 
-    def run(self, edit):
-        self.output = ''
-        sublime.set_timeout_async(self.clean)
-        sublime.set_timeout_async(self.printoutput)
+    def read_handle(self, handle):
+        chunk_size = 2 ** 13
+        out = b''
+        while True:
+            try:
+                data = os.read(handle.fileno(), chunk_size)
+                # If exactly the requested number of bytes was
+                # read, there may be more data, and the current
+                # data may contain part of a multibyte char
+                out += data
+                if len(data) == chunk_size:
+                    continue
+                if data == b'' and out == b'':
+                    raise IOError('EOF')
+                # We pass out to a function to ensure the
+                # timeout gets the value of out right now,
+                # rather than a future (mutated) version
+                self.queue_write(out.decode(self.encoding))
+                if data == b'':
+                    raise IOError('EOF')
+                out = b''
+            except (UnicodeDecodeError) as e:
+                msg = 'Error decoding output using %s - %s'
+                self.queue_write(msg % (self.encoding, str(e)))
+                break
+            except (IOError):
+                if self.killed:
+                    msg = 'Cancelled'
+                else:
+                    self.ed = time.perf_counter()
+                    msg = 'Finished in %.2fs' % (self.ed - self.st)
+                self.queue_write('[%s]' % msg)
+                break
 
-    def clean(self):
-        p = self.view.window().folders()[0]
-        curdir = os.getcwd()
-        os.chdir(p)
-        try:
-            self.output = "====================Clean====================\n"
+    def queue_write(self, text):
+        sublime.set_timeout(lambda: self.do_write(text), 1)
 
-            self.output += subprocess.check_output(
-                                                "make clean",
-                                                universal_newlines=True,
-                                                stderr=subprocess.STDOUT,
-                                                shell=True
-                                                )
-
-        except CalledProcessError as e:
-            self.output = "====================Error====================\n"
-            self.output += str(e.output) + "\nExit Code: " + str(e.returncode)
-        finally:
-            os.chdir(curdir)
-
-    def show_output(self, message):
-        panel = self.view.window().create_output_panel("CppBuilder")
-
-        with Edit(panel) as edit:
-            edit.insert(0, message)
-
-        self.view.window().run_command(
-            'show_panel', {'panel': 'output.CppBuilder'})
-
-    def printoutput(self):
-        self.show_output(self.output)
-
-
-class BuildRunCheckProjectCommand(sublime_plugin.TextCommand):
-
-    # Build the project then run it, assuming the project doesn't need input
-    # from the terminal/command-line
-
-    def run(self, edit):
-        self.output = ''
-
-        # async run the build so sublime doesn't hang
-
-        sublime.set_timeout_async(self.buildruncheck)
-        sublime.set_timeout_async(self.printoutput)
-
-    def buildruncheck(self):
-
-        # get the folder so we can also retrive the name of the project
-        p = self.view.window().folders()[0]
-
-        curdir = os.getcwd()
-        proj_name = os.path.basename(p)
-
-        if sublime.platform() == 'windows':
-            proj_name += '.exe'
-        else:
-            proj_name += '.out'
-
-        os.chdir(p)  # go to our project folder
-
-        self.proj_name = proj_name
-
-        try:
-            self.output = "====================Build====================\n"
-
-            self.output += subprocess.check_output(
-                                                "make",
-                                                universal_newlines=True,
-                                                stderr=subprocess.STDOUT,
-                                                shell=True
-                                                )
-
-            self.output += "==================== Run ====================\n"
-
-            if sublime.platform() == 'windows':
-                self.output += subprocess.check_output(
-                                                ["build\\" + self.proj_name],
-                                                universal_newlines=True,
-                                                shell=True,
-                                                stderr=subprocess.STDOUT)
-            else:
-                self.output += subprocess.check_output(
-                                                ["build/" + self.proj_name],
-                                                universal_newlines=True,
-                                                shell=True,
-                                                stderr=subprocess.STDOUT)
-
-        except CalledProcessError as e:
-
-            self.output = "====================Error====================\n"
-            self.output += str(e.output) + "\nExit Code: " + str(e.returncode)
-
-        except Exception as e:
-
-            self.show_output(
-                            "Could Not Excute File: " +
-                            str(e.strerror) +
-                            " [{}]".format(self.proj_name)
-                            )
-        finally:
-            os.chdir(curdir)
-
-    def show_output(self, message):
-        panel = self.view.window().create_output_panel("CppBuilder")
-
-        with Edit(panel) as edit:
-            edit.insert(0, message)
-
-        self.view.window().run_command(
-                                    'show_panel',
-                                    {'panel': 'output.CppBuilder'}
-                                    )
-
-    def printoutput(self):
-        self.show_output(self.output)
-
-
-class RunFileOutCommand(sublime_plugin.TextCommand):
-
-    def run(self, edit):
-        sublime.set_timeout_async(self.run_single_output)
-        sublime.set_timeout_async(self.remove_ex, 1000)
-
-    def run_single_output(self):
-        p = self.view.window().folders()[0]
-
-        if sublime.platform() == 'windows':
-            p += "\\build\\{}.exe".format(os.path.basename(p))
-        else:
-            p += "/build/{}.out".format(os.path.basename(p))
-
-        self.sharex = self.get_bat_ex()
-        command = self.get_shell_command()
-
-        command.append(self.sharex)
-        command.append(p)
-        process = 0
-
-        try:
-            if sublime.platform() == 'window':
-
-                process = subprocess.Popen(
-                                        command,
-                                        shell=False,
-                                        universal_newlines=True,
-                                        creationflags=CREATE_NEW_CONSOLE
-                                        )
-            else:
-                # go to the build directory and run the command
-                curdir = os.curdir
-                os.chdir(os.path.dirname(p))
-                process = subprocess.Popen(command)
-                os.chdir(curdir)
-
-        except CalledProcessError as e:
-            print(e.output)
-            process.terminate()
-
-    def remove_ex(self):
-        os.remove(self.sharex)
-
-    def get_bat_ex(self):
-        # the zip file will have scripts for running the executable
-        # so we have to extract them based on the platform
-
-        ls = sublime.packages_path()
-        curdir = os.getcwd()
-        os.chdir(ls)
-        os.chdir("..")
-        os.chdir("Installed Packages")
-        t = zipfile.ZipFile("CppBuilder.sublime-package")
-
-        if sublime.platform() == 'windows':
-            out = t.extract("sharEx.bat")
-        else:
-            # course on linux based system we have to change the permission
-            out = t.extract("sharEx.sh")
-            os.chmod(out, 0o777)  # this an over kill for a simple script
-
-        os.chdir(curdir)
-        return out
-
-    def get_shell_command(self):
-        if sublime.platform() == 'windows':
-            return ["cmd", "/C"]
-        else:
-            settings = sublime.load_settings("CppBuilder.sublime-settings")
-            options = settings.get('terminal_opts')
-            options.insert(0, settings.get('terminal_emu'))
-            return options
-
-        # p = self.view.window().folders()[0]
-        # if sublime.platform() == 'windows':
-        #     p += "/" + os.path.basename(p) + ".sublime-project"
-        # else:
-        #     p += "\\" + os.path.basename(p) + ".sublime-project"
+    def do_write(self, text):
+        with self.panel_lock:
+            self.panel.run_command('append', {'characters': text})

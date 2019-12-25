@@ -2,51 +2,39 @@ import sublime
 import sublime_plugin
 import os
 import json
-import sys
 from CppBuilder.MakerClass import Makerfile
 
 
-class MakeProjectCommand(sublime_plugin.TextCommand):
+class ProjectMakefileCommand(sublime_plugin.TextCommand):
 
     def run(self, edit):
-        settings = self.get_settings()
-        if settings:
-            proj_base = self.view.window().folders()[0]
-
-            src = proj_base
-            makefile = proj_base
-
-            if sys.platform.startswith('linux'):
-                src += "/src"
-                makefile += "/Makefile"
-            else:
-                 src += "\\src"
-                 makefile += "\\Makefile"
-
-            maker = Makerfile(settings, src, "obj", "build", "header")
-
-            make_string = maker.make_file()
-
-            if sys.platform.startswith('linux'):
-                make_string = make_string.replace('\\', '/')
-            f = open(makefile, "w")
-                
-            f.write(make_string)
-
-            f.close()
-
-            sublime.active_window().open_file(makefile)
-        sublime.status_message("Error in settings file")
-
-    def get_settings(self):
         project_folder = self.view.window().folders()[0]
+
+        back_out = os.getcwd()
+        os.chdir(project_folder)
+        try:
+            settings = self.get_settings(project_folder)
+            if settings:
+                pwd = self.view.window().folders()[0]
+
+                maker = Makerfile(settings, pwd, is_single_file=False)
+                make_string = maker.make_file()
+
+                makefile_name = os.path.join(pwd, 'Makefile')
+                with open(makefile_name, "w") as f:
+                    f.write(make_string)
+
+                sublime.active_window().open_file(makefile_name)
+
+            sublime.status_message("Error in .sublime-project file")
+        finally:
+            os.chdir(back_out)
+
+    def get_settings(self, project_folder):
         proj_name = os.path.basename(project_folder)
-        setting_name = "\\{}.sublime-project".format(proj_name)
+        setting_name = "{}{}.sublime-project".format(os.sep, proj_name)
 
-        if sys.platform.startswith('linux'):
-            setting_name = setting_name.replace('\\', '/')
-
-        print(project_folder + setting_name)
+        print('Loading settings for:', project_folder + setting_name)
         return self.load_json(project_folder + setting_name)
 
     def load_json(self, json_file):
@@ -54,9 +42,16 @@ class MakeProjectCommand(sublime_plugin.TextCommand):
         j = None
         try:
             j = json.load(f).get('settings')
-
+        except ValueError:
+            sublime.error_message(
+                "Error while reading .sublime-project file.\n"
+                "Check if there is unecessary comma at end of line in file"
+            )
         except Exception:
-            print("Error Parsing Project File, there is a bug in the file")
+            sublime.error_message(
+                "CppBuilder - Making Project: Unknown error while reading .sub"
+                "lime-project file"
+            )
         finally:
             f.close()
 

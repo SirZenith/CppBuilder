@@ -1,0 +1,6 @@
+{
+    "target": "cpp_builder_list",
+    "selector": ["source.cpp", "source.c"],
+    "keyfiles": ["makefile", "Makefile"],
+    "cancel": {"kill": true}
+}
