@@ -1,5 +1,5 @@
 [
-    {"command": "project_makefile",     "keys": ["ctrl+alt+m"]},
-    {"command": "single_file_makefile", "keys": ["ctrl+alt+n"]},
+    {"command": "makefile_from_project",     "keys": ["ctrl+alt+m"]},
+    {"command": "makefile_from_file", "keys": ["ctrl+alt+n"]},
     {"command": "new_cpp_project",      "keys": ["ctrl+alt+c"]}
 ]

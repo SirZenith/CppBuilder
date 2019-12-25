@@ -3,11 +3,11 @@ import shutil
 import sublime
 import sublime_plugin
 
-from CppBuilder.MakerClass import Makerfile
-from CppBuilder.ProjectHandler import ProjectHandler
+from .MakerClass import Makerfile
+from .ProjectHandler import ProjectHandler
 
 
-class SingleFileMakefileCommand(sublime_plugin.TextCommand):
+class MakefileFromFileCommand(sublime_plugin.TextCommand):
 
     def run(self, edit):
         stgname = "CppBuilder.sublime-settings"

@@ -2,10 +2,10 @@ import sublime
 import sublime_plugin
 import os
 import json
-from CppBuilder.MakerClass import Makerfile
+from .MakerClass import Makerfile
 
 
-class ProjectMakefileCommand(sublime_plugin.TextCommand):
+class MakefileFromProjectCommand(sublime_plugin.TextCommand):
 
     def run(self, edit):
         project_folder = self.view.window().folders()[0]
